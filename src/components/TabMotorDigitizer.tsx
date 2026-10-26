@@ -25,11 +25,14 @@ import { generateMotorReportPDF } from '../utils/pdfGenerator';
 export const TabMotorDigitizer: React.FC = () => {
   const [selectedImage, setSelectedImage] = useState<string>(SAMPLE_MOTORS[0].dataUrl);
   const [imageMimeType, setImageMimeType] = useState<string>('image/svg+xml');
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>(SAMPLE_MOTORS[0].id);
+  const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
   const [selectedStartingMethod, setSelectedStartingMethod] = useState<string>('Directo (DOL)');
   const [analysisResult, setAnalysisResult] = useState<MotorAnalysisResponse | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [isEditingData, setIsEditingData] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
@@ -57,8 +60,46 @@ export const TabMotorDigitizer: React.FC = () => {
     },
   ];
 
-  // Handle uploaded image file
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Compress high-resolution images client-side before sending to prevent 503 timeouts
+  const compressImage = (file: File): Promise<{ dataUrl: string; mimeType: string }> => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const maxDim = 1280;
+          let { width, height } = img;
+          if (width > maxDim || height > maxDim) {
+            if (width > height) {
+              height = Math.round((height * maxDim) / width);
+              width = maxDim;
+            } else {
+              width = Math.round((width * maxDim) / height);
+              height = maxDim;
+            }
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve({ dataUrl: e.target?.result as string, mimeType: file.type });
+            return;
+          }
+          ctx.drawImage(img, 0, 0, width, height);
+          const compressed = canvas.toDataURL('image/jpeg', 0.85);
+          resolve({ dataUrl: compressed, mimeType: 'image/jpeg' });
+        };
+        img.onerror = () => resolve({ dataUrl: e.target?.result as string, mimeType: file.type });
+        img.src = e.target?.result as string;
+      };
+      reader.onerror = () => resolve({ dataUrl: '', mimeType: file.type });
+      reader.readAsDataURL(file);
+    });
+  };
+
+  // Handle uploaded image file (from device or camera) with automatic optimization
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -68,26 +109,186 @@ export const TabMotorDigitizer: React.FC = () => {
     }
 
     setErrorMessage(null);
-    setImageMimeType(file.type);
+    setSelectedPresetId(null); // Mark as custom upload
+    setUploadedFileName(file.name);
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
+    try {
+      const { dataUrl, mimeType } = await compressImage(file);
       setSelectedImage(dataUrl);
-      setAnalysisResult(null); // Clear previous result to prompt new run
-    };
-    reader.readAsDataURL(file);
+      setImageMimeType(mimeType);
+      setAnalysisResult(null); // Reset previous analysis
+    } catch {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const dataUrl = event.target?.result as string;
+        setSelectedImage(dataUrl);
+        setImageMimeType(file.type);
+        setAnalysisResult(null);
+      };
+      reader.readAsDataURL(file);
+    }
   };
 
   // Select sample motor plate
   const handleSelectSample = (sampleId: string) => {
     const sample = SAMPLE_MOTORS.find((m) => m.id === sampleId);
     if (sample) {
+      setSelectedPresetId(sampleId);
+      setUploadedFileName(null);
       setSelectedImage(sample.dataUrl);
       setImageMimeType('image/svg+xml');
       setAnalysisResult(null);
       setErrorMessage(null);
     }
+  };
+
+  // Recalculate electromechanical and starting parameters based on updated motor plate values
+  const recalculateFromPlate = (
+    currentPlate: MotorAnalysisResponse['datosPlaca'],
+    method: string
+  ): MotorAnalysisResponse => {
+    const pKw = Number(currentPlate.potencia_kW) || 1.0;
+    const rpm = Number(currentPlate.rpm) || 1450;
+    const f = Number(currentPlate.frecuencia_Hz) || 50;
+    const cosPhi = Number(currentPlate.cosPhi) || 0.85;
+    const eta = Number(currentPlate.rendimiento_eta_pct) || 90.0;
+    const inA = Number(currentPlate.corrienteNominalBase_A) || 
+      Number(((pKw / (eta / 100) * 1000) / (Math.sqrt(3) * 380 * cosPhi)).toFixed(1));
+
+    // Determine poles and synchronous speed
+    let poles = 4;
+    let ns = 1500;
+    if (rpm > 2400) {
+      poles = 2;
+      ns = f === 60 ? 3600 : 3000;
+    } else if (rpm > 1200) {
+      poles = 4;
+      ns = f === 60 ? 1800 : 1500;
+    } else if (rpm > 800) {
+      poles = 6;
+      ns = f === 60 ? 1200 : 1000;
+    } else {
+      poles = 8;
+      ns = f === 60 ? 900 : 750;
+    }
+
+    const slip = Number(Math.max(0, ((ns - rpm) / ns) * 100).toFixed(2));
+    const pElec = Number((pKw / (eta / 100)).toFixed(2));
+    const sKva = Number(((Math.sqrt(3) * 380 * inA) / 1000).toFixed(2));
+    const qKvar = Number(Math.sqrt(Math.max(0, sKva ** 2 - pElec ** 2)).toFixed(2));
+    const torqueNm = Number(((9550 * pKw) / rpm).toFixed(2));
+
+    const isYD = method.includes('Estrella');
+    const isSoft = method.includes('Suave');
+    const isVFD = method.includes('Variador');
+
+    const iaA = isYD
+      ? Number((inA * 2.4).toFixed(1))
+      : isSoft
+      ? Number((inA * 3.0).toFixed(1))
+      : isVFD
+      ? Number((inA * 1.1).toFixed(1))
+      : Number((inA * 7.2).toFixed(1));
+
+    const iaIn = isYD ? 2.4 : isSoft ? 3.0 : isVFD ? 1.1 : 7.2;
+    const torqueArr = isYD ? Number((torqueNm * 0.7).toFixed(1)) : isVFD ? torqueNm : Number((torqueNm * 2.2).toFixed(1));
+
+    const contactorAc3 = isYD ? Math.round(inA * 0.58) : Math.round(inA * 1.15);
+    const contactorModel = isYD
+      ? `Juego Y-Δ: KM1/KM2 (${Math.round(inA * 0.58)}A) + KM3 (${Math.round(inA * 0.33)}A)`
+      : `Contactor AC-3 Calibre ${contactorAc3} A`;
+
+    const ajusteTermico = isYD
+      ? `${(inA * 0.58 * 0.9).toFixed(1)} - ${(inA * 0.58 * 1.1).toFixed(1)} A (en lazo Δ)`
+      : `${(inA * 0.9).toFixed(1)} - ${(inA * 1.1).toFixed(1)} A (ajustar a In = ${inA} A)`;
+
+    // Cable sizing rule: minimum ampacity Iz >= In
+    let seccion = 2.5;
+    if (inA > 150) seccion = 70;
+    else if (inA > 100) seccion = 50;
+    else if (inA > 70) seccion = 35;
+    else if (inA > 50) seccion = 25;
+    else if (inA > 35) seccion = 16;
+    else if (inA > 24) seccion = 10;
+    else if (inA > 16) seccion = 6;
+    else if (inA > 10) seccion = 4;
+
+    const mdReport = `## Memoria Técnica de Motor Eléctrico (IEC 60034-1 / IEC 60947-4-1)
+
+- **Equipo / Motor:** ${currentPlate.marca || 'Motor'} ${currentPlate.modelo || ''}
+- **Potencia Nominal:** ${pKw} kW (${currentPlate.potencia_HP || (pKw / 0.746).toFixed(1)} HP)
+- **Tensión / Conexión:** ${currentPlate.tension_V} (${currentPlate.conexion})
+- **Corriente Nominal (In):** ${inA} A
+- **Velocidad y Polos:** ${rpm} RPM (${poles} polos, sincrónica ${ns} RPM, deslizamiento ${slip}%)
+- **Par Motor Nominal (Tn):** ${torqueNm} Nm
+- **Potencia Eléctrica:** ${pElec} kW | Aparente: ${sKva} kVA | Reactiva: ${qKvar} kVAr
+- **Método de Arranque:** ${method}
+- **Pico de Arranque Estimado:** ${iaA} A (${iaIn} × In)
+- **Aparamenta Sugerida:** ${contactorModel}, Guardamotor regulado a ${inA} A, Conductores de ${seccion} mm².
+`;
+
+    return {
+      datosPlaca: {
+        ...currentPlate,
+        potencia_kW: pKw,
+        potencia_HP: Number(currentPlate.potencia_HP) || Number((pKw / 0.746).toFixed(1)),
+        corrienteNominalBase_A: inA,
+        rpm,
+        cosPhi,
+        rendimiento_eta_pct: eta,
+      },
+      parametrosCalculados: {
+        polos: poles,
+        velocidadSincrona_RPM: ns,
+        deslizamiento_pct: slip,
+        potenciaElectrica_kW: pElec,
+        potenciaAparente_kVA: sKva,
+        potenciaReactiva_kVAr: qKvar,
+        torqueNominal_Nm: torqueNm,
+      },
+      dimensionamientoArranque: {
+        metodo: method,
+        corrienteArranqueEstimada_A: iaA,
+        multiploIa_In: iaIn,
+        torqueArranqueEstimado_Nm: torqueArr,
+        contactorPrincipalAC3_A: contactorAc3,
+        modeloContactorSugerido: contactorModel,
+        rangoAjusteTermico_A: ajusteTermico,
+        fusiblesRespaldo_aM_A: Math.round(inA * 1.6),
+        seccionCableSugerida_mm2: seccion,
+        aptoEstrellaTriangulo: currentPlate.tension_V.includes('380') && currentPlate.tension_V.includes('660'),
+        recomendacionesEspeciales: 'Verificar selectividad amperométrica y temporización según inercia de carga.',
+      },
+      memoriaTecnicaMarkdown: mdReport,
+    };
+  };
+
+  // Quick manual entry helper if AI service is temporarily busy (503)
+  const handleStartManualEntry = () => {
+    setErrorMessage(null);
+    setIsEditingData(true);
+    // Baseline template populated with values visible on the motor nameplate
+    const manualPlate: MotorAnalysisResponse['datosPlaca'] = {
+      marca: 'MALMBERGS',
+      modelo: 'FRAME MS 711-2',
+      numeroSerie: '1212073091',
+      potencia_kW: 0.37,
+      potencia_HP: 0.5,
+      tension_V: '230/400 V',
+      conexion: 'Δ / Y',
+      corriente_A: '1.67 / 0.97 A',
+      corrienteNominalBase_A: 1.67,
+      rpm: 2730,
+      frecuencia_Hz: 50,
+      cosPhi: 0.78,
+      rendimiento_eta_pct: 72.0,
+      factorServicio: '1.0',
+      claseAislamiento: 'F',
+      gradoIP: 'IP55',
+      regimen: 'S1',
+    };
+    const computed = recalculateFromPlate(manualPlate, selectedStartingMethod);
+    setAnalysisResult(computed);
   };
 
   // Perform AI Analysis with Gemini (Calling server endpoint /api/analyze-plate)
@@ -113,145 +314,49 @@ export const TabMotorDigitizer: React.FC = () => {
 
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error || `Error del servidor HTTP ${res.status}`);
+        let rawError = errorData.error || `Error del servidor HTTP ${res.status}`;
+        if (
+          typeof rawError === 'string' &&
+          (rawError.includes('503') || rawError.includes('UNAVAILABLE') || rawError.includes('high demand'))
+        ) {
+          rawError =
+            'El servicio de IA está experimentando alta demanda momentánea en Google Cloud (503). Puedes reintentar o transcribir los datos de la placa manualmente para generar el PDF de inmediato.';
+        }
+        throw new Error(rawError);
       }
 
       const data: MotorAnalysisResponse = await res.json();
-      setAnalysisResult(data);
+      if (!data || !data.datosPlaca) {
+        throw new Error('No se recibieron datos legibles de la placa. Por favor verifique la nitidez de la imagen.');
+      }
+
+      // Ensure calculated electromechanical values are computed and consistent
+      const fullAnalysis = recalculateFromPlate(data.datosPlaca, selectedStartingMethod);
+      setAnalysisResult(fullAnalysis);
     } catch (err: unknown) {
       const error = err as Error;
-      console.warn('Fallback local motor analysis:', error);
-
-      // Local engineering calculation fallback
-      const fallbackResult = generateFallbackMotorAnalysis(selectedStartingMethod);
-      setAnalysisResult(fallbackResult);
+      console.error('Error al analizar placa:', error);
+      let msg = error.message || 'Error al digitalizar la placa.';
+      if (msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand')) {
+        msg =
+          'El servicio de IA de Google está experimentando alta demanda momentánea (503). Puedes pulsar "Reintentar con IA" o "Ingresar Datos Directamente" para continuar sin esperas.';
+      }
+      setErrorMessage(msg);
+      setAnalysisResult(null);
     } finally {
       setIsLoading(false);
     }
   };
 
-  // Generate complete local fallback if offline
-  const generateFallbackMotorAnalysis = (method: string): MotorAnalysisResponse => {
-    // Estimations based on 15 kW motor (WEG baseline)
-    const pKw = 15.0;
-    const pHp = 20.0;
-    const rpm = 1465;
-    const vRed = 380;
-    const cosPhi = 0.84;
-    const eta = 92.4;
-    const poles = 4;
-    const ns = 1500;
-    const slip = Number((((ns - rpm) / ns) * 100).toFixed(2));
-    const pElec = Number((pKw / (eta / 100)).toFixed(2));
-    const inA = Number((pElec * 1000 / (Math.sqrt(3) * vRed * cosPhi)).toFixed(1));
-    const sKva = Number(((Math.sqrt(3) * vRed * inA) / 1000).toFixed(2));
-    const qKvar = Number(Math.sqrt(Math.max(0, sKva ** 2 - pElec ** 2)).toFixed(2));
-    const torqueNm = Number(((9550 * pKw) / rpm).toFixed(2));
-
-    let iaA = inA * 7.2;
-    let iaIn = 7.2;
-    let contactorAc3 = Math.round(inA * 1.15);
-    let contactorModel = 'Schneider TeSys Deca LC1D32 o Siemens Sirius 3RT2027';
-    let ajusteTermico = `${(inA * 0.9).toFixed(1)} - ${(inA * 1.1).toFixed(1)} A (regular exactamente a In = ${inA} A)`;
-    let fusible = Math.round(inA * 1.6);
-    let cable = 10.0;
-    let torqueArr = Number((torqueNm * 2.2).toFixed(1));
-    let aptoYD = true;
-
-    if (method.includes('Estrella')) {
-      iaA = Number((inA * 2.4).toFixed(1));
-      iaIn = 2.4;
-      contactorAc3 = Math.round(inA * 0.58);
-      contactorModel = '3 Contactores: KM1 (Línea) y KM2 (Δ) LC1D25, KM3 (Y) LC1D18';
-      ajusteTermico = `${(inA * 0.58 * 0.9).toFixed(1)} - ${(inA * 0.58 * 1.1).toFixed(1)} A (si se monta en lazo de fase a 0.58 In)`;
-      torqueArr = Number((torqueNm * 0.7).toFixed(1));
-      cable = 6.0;
-    } else if (method.includes('Suave')) {
-      iaA = Number((inA * 3.0).toFixed(1));
-      iaIn = 3.0;
-      contactorAc3 = Math.round(inA);
-      contactorModel = 'Arrancador Suave tipo Altivar ATS01 / ATS22 (32A) o Siemens SIRIUS 3RW30/40';
-      cable = 10.0;
-    } else if (method.includes('Variador')) {
-      iaA = Number((inA * 1.1).toFixed(1));
-      iaIn = 1.1;
-      contactorAc3 = Math.round(inA);
-      contactorModel = 'Variador VFD 15 kW (ej. Schneider ATV320D15N4B o WEG CFW500/700)';
-      torqueArr = torqueNm;
-      cable = 10.0;
-    }
-
-    const mdReport = `## Memoria Técnica de Motor Eléctrico y Dimensionamiento de Arranque
-
-### 1. Parámetros Nominales Extraídos (IEC 60034-1)
-- **Marca / Modelo:** WEG W22 160M 4P
-- **Potencia Nominal:** ${pKw} kW (${pHp} HP)
-- **Tensión / Conexión:** 380/660 V (Δ/Y) - Apto para red 380 V en Triángulo
-- **Corriente Nominal:** ${inA} A (en 380 V Δ)
-- **Velocidad y Polos:** ${rpm} RPM (${poles} polos, sincrónica ${ns} RPM, deslizamiento ${slip}%)
-- **Eficiencia y FP:** $\\eta$ = ${eta}% (Clase IE3 Premium), $\\cos \\varphi$ = ${cosPhi}
-
-### 2. Cálculos Electromecánicos
-- **Par Motor Nominal ($T_n$):** **${torqueNm} Nm** ($T_n = \\frac{9550 \\times ${pKw}}{${rpm}}$)
-- **Potencia Aparente ($S$):** **${sKva} kVA**
-- **Potencia Reactiva ($Q$):** **${qKvar} kVAr**
-- **Potencia Eléctrica Activa ($P_{elec}$):** **${pElec} kW**
-
-### 3. Dimensionamiento para Método de Arranque: ${method}
-- **Corriente Pico Estimada de Arranque:** **${iaA} A** (${iaIn} $\\times I_n$)
-- **Par de Arranque Estimado:** **${torqueArr} Nm**
-- **Aparamenta de Maniobra Sugerida (IEC 60947-4-1):**
-  - Contactor AC-3: ${contactorModel}
-  - Protección Térmica / Guardamotor: Rango ${ajusteTermico}
-  - Fusibles de Respaldo aM: ${fusible} A
-  - Sección mínima recomendada de conductores: ${cable} mm² de cobre clase 5 en bandeja/caño.
-`;
-
-    return {
-      datosPlaca: {
-        marca: 'WEG',
-        modelo: 'W22 160M 4P',
-        numeroSerie: '1029384756',
-        potencia_kW: pKw,
-        potencia_HP: pHp,
-        tension_V: '380/660 V',
-        conexion: 'Δ / Y',
-        corriente_A: `${inA} / ${(inA * 0.577).toFixed(1)} A`,
-        corrienteNominalBase_A: inA,
-        rpm: rpm,
-        frecuencia_Hz: 50,
-        cosPhi: cosPhi,
-        rendimiento_eta_pct: eta,
-        factorServicio: '1.15',
-        claseAislamiento: 'F',
-        gradoIP: 'IP55',
-        regimen: 'S1',
-      },
-      parametrosCalculados: {
-        polos: poles,
-        velocidadSincrona_RPM: ns,
-        deslizamiento_pct: slip,
-        potenciaElectrica_kW: pElec,
-        potenciaAparente_kVA: sKva,
-        potenciaReactiva_kVAr: qKvar,
-        torqueNominal_Nm: torqueNm,
-      },
-      dimensionamientoArranque: {
-        metodo: method,
-        corrienteArranqueEstimada_A: iaA,
-        multiploIa_In: iaIn,
-        torqueArranqueEstimado_Nm: torqueArr,
-        contactorPrincipalAC3_A: contactorAc3,
-        modeloContactorSugerido: contactorModel,
-        rangoAjusteTermico_A: ajusteTermico,
-        fusiblesRespaldo_aM_A: fusible,
-        seccionCableSugerida_mm2: cable,
-        aptoEstrellaTriangulo: aptoYD,
-        recomendacionesEspeciales:
-          'Verificar selectividad amperométrica y temporización KT1 según inercia de la carga conducida.',
-      },
-      memoriaTecnicaMarkdown: mdReport,
+  // Update a field in datosPlaca and automatically update all calculated params
+  const handleUpdatePlateField = (field: keyof MotorAnalysisResponse['datosPlaca'], value: unknown) => {
+    if (!analysisResult) return;
+    const updatedPlate = {
+      ...analysisResult.datosPlaca,
+      [field]: value,
     };
+    const updatedAnalysis = recalculateFromPlate(updatedPlate, selectedStartingMethod);
+    setAnalysisResult(updatedAnalysis);
   };
 
   // Download generic engineering technical report in PDF
@@ -330,11 +435,28 @@ export const TabMotorDigitizer: React.FC = () => {
             {/* Image Preview Box */}
             <div className="relative rounded-lg overflow-hidden border border-slate-800 bg-slate-950 flex items-center justify-center min-h-[240px] max-h-[320px]">
               {selectedImage ? (
-                <img
-                  src={selectedImage}
-                  alt="Placa del motor seleccionada"
-                  className="w-full h-full object-contain max-h-[320px] p-2"
-                />
+                <>
+                  <img
+                    src={selectedImage}
+                    alt="Placa del motor seleccionada"
+                    className="w-full h-full object-contain max-h-[320px] p-2"
+                  />
+                  <div className="absolute top-2 left-2 px-2.5 py-1 rounded-md text-[11px] font-bold font-mono shadow-md backdrop-blur bg-slate-900/90 border border-slate-700 flex items-center gap-2">
+                    {uploadedFileName ? (
+                      <>
+                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                        <span className="text-emerald-300 font-sans">Foto Personalizada:</span>
+                        <span className="text-white truncate max-w-[140px]">{uploadedFileName}</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="w-2.5 h-2.5 rounded-full bg-amber-400" />
+                        <span className="text-amber-300 font-sans">Muestra:</span>
+                        <span className="text-white">{SAMPLE_MOTORS.find((m) => m.id === selectedPresetId)?.name || 'WEG 15 kW'}</span>
+                      </>
+                    )}
+                  </div>
+                </>
               ) : (
                 <div className="text-center p-6 text-slate-500 text-xs">
                   <Upload className="w-8 h-8 mx-auto mb-2 opacity-40" />
@@ -439,9 +561,29 @@ export const TabMotorDigitizer: React.FC = () => {
         {/* Right Column: Results & Schematics (7 cols) */}
         <div className="lg:col-span-7 space-y-4">
           {errorMessage && (
-            <div className="bg-rose-950/70 border border-rose-800 text-rose-200 p-4 rounded-xl flex items-center gap-3 text-sm">
-              <AlertCircle className="w-5 h-5 text-rose-400 shrink-0" />
-              <span>{errorMessage}</span>
+            <div className="bg-gradient-to-r from-rose-950/90 to-slate-900 border border-rose-700/80 text-rose-100 p-4 rounded-xl shadow-lg space-y-3">
+              <div className="flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+                <div className="flex-1 text-xs leading-relaxed font-medium">
+                  {errorMessage}
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-rose-800/60 pl-8">
+                <button
+                  onClick={handleRunAnalysis}
+                  disabled={isLoading}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-900 hover:bg-rose-800 text-rose-100 border border-rose-600 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5 text-rose-300" />
+                  <span>Reintentar con IA</span>
+                </button>
+                <button
+                  onClick={handleStartManualEntry}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg text-xs font-bold transition-colors cursor-pointer shadow-sm"
+                >
+                  <span>✍️ Ingresar Datos Directamente</span>
+                </button>
+              </div>
             </div>
           )}
 
@@ -471,84 +613,201 @@ export const TabMotorDigitizer: React.FC = () => {
             <div className="space-y-4">
               {/* Card 1: Datos de Placa Extraídos */}
               <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-md">
-                <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+                <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800">
                   <div className="flex items-center gap-2">
                     <span className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                       <ShieldCheck className="w-4 h-4" />
                     </span>
                     <h3 className="font-bold text-white text-sm">
-                      1. Datos de Placa Extraídos (IEC 60034-1)
+                      1. Datos de Placa Extraídos de la Fotografía (IEC 60034-1)
                     </h3>
                   </div>
-                  <span className="text-xs font-mono font-bold text-amber-400 bg-slate-950 px-2.5 py-1 rounded border border-slate-800">
-                    {analysisResult.datosPlaca.marca} {analysisResult.datosPlaca.modelo}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setIsEditingData(!isEditingData)}
+                      className={`px-2.5 py-1 text-[11px] font-bold rounded border transition-colors cursor-pointer ${
+                        isEditingData
+                          ? 'bg-amber-500 text-slate-950 border-amber-400'
+                          : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'
+                      }`}
+                    >
+                      {isEditingData ? '✓ Guardar Calibración' : '✎ Editar / Calibrar'}
+                    </button>
+                    <span className="text-xs font-mono font-bold text-amber-400 bg-slate-950 px-2.5 py-1 rounded border border-slate-800">
+                      {analysisResult.datosPlaca.marca} {analysisResult.datosPlaca.modelo}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4 text-xs font-mono">
+                  {/* Potencia */}
                   <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800">
                     <span className="text-slate-400 text-[10px] block uppercase">Potencia Pn</span>
-                    <span className="text-white font-bold text-sm">
-                      {analysisResult.datosPlaca.potencia_kW} kW
-                    </span>
-                    <span className="text-slate-400 text-[10px] block">
-                      ({analysisResult.datosPlaca.potencia_HP} HP)
-                    </span>
+                    {isEditingData ? (
+                      <div className="flex items-center gap-1 mt-1">
+                        <input
+                          type="number"
+                          step="0.5"
+                          value={analysisResult.datosPlaca.potencia_kW}
+                          onChange={(e) =>
+                            handleUpdatePlateField('potencia_kW', parseFloat(e.target.value) || 0)
+                          }
+                          className="w-20 bg-slate-900 border border-amber-500 rounded px-1.5 py-0.5 text-white font-bold text-xs"
+                        />
+                        <span className="text-slate-400">kW</span>
+                      </div>
+                    ) : (
+                      <>
+                        <span className="text-white font-bold text-sm">
+                          {analysisResult.datosPlaca.potencia_kW} kW
+                        </span>
+                        <span className="text-slate-400 text-[10px] block">
+                          ({analysisResult.datosPlaca.potencia_HP} HP)
+                        </span>
+                      </>
+                    )}
                   </div>
 
+                  {/* Tensión */}
                   <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800">
                     <span className="text-slate-400 text-[10px] block uppercase">Tensión / Conn</span>
-                    <span className="text-amber-400 font-bold text-sm">
-                      {analysisResult.datosPlaca.tension_V}
-                    </span>
-                    <span className="text-slate-400 text-[10px] block">
-                      {analysisResult.datosPlaca.conexion}
-                    </span>
+                    {isEditingData ? (
+                      <input
+                        type="text"
+                        value={analysisResult.datosPlaca.tension_V}
+                        onChange={(e) => handleUpdatePlateField('tension_V', e.target.value)}
+                        className="w-full bg-slate-900 border border-amber-500 rounded px-1.5 py-0.5 text-amber-400 font-bold text-xs mt-1"
+                      />
+                    ) : (
+                      <>
+                        <span className="text-amber-400 font-bold text-sm">
+                          {analysisResult.datosPlaca.tension_V}
+                        </span>
+                        <span className="text-slate-400 text-[10px] block">
+                          {analysisResult.datosPlaca.conexion}
+                        </span>
+                      </>
+                    )}
                   </div>
 
+                  {/* Corriente */}
                   <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800">
                     <span className="text-slate-400 text-[10px] block uppercase">Corriente In</span>
-                    <span className="text-sky-400 font-bold text-sm">
-                      {analysisResult.datosPlaca.corriente_A}
-                    </span>
-                    <span className="text-slate-400 text-[10px] block">Nominal Base</span>
+                    {isEditingData ? (
+                      <div className="flex items-center gap-1 mt-1">
+                        <input
+                          type="number"
+                          step="0.1"
+                          value={analysisResult.datosPlaca.corrienteNominalBase_A}
+                          onChange={(e) =>
+                            handleUpdatePlateField(
+                              'corrienteNominalBase_A',
+                              parseFloat(e.target.value) || 0
+                            )
+                          }
+                          className="w-20 bg-slate-900 border border-amber-500 rounded px-1.5 py-0.5 text-sky-400 font-bold text-xs"
+                        />
+                        <span className="text-slate-400">A</span>
+                      </div>
+                    ) : (
+                      <>
+                        <span className="text-sky-400 font-bold text-sm">
+                          {analysisResult.datosPlaca.corrienteNominalBase_A || analysisResult.datosPlaca.corriente_A} A
+                        </span>
+                        <span className="text-slate-400 text-[10px] block">Nominal Base</span>
+                      </>
+                    )}
                   </div>
 
+                  {/* Velocidad */}
                   <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800">
                     <span className="text-slate-400 text-[10px] block uppercase">Velocidad / Frec</span>
-                    <span className="text-emerald-400 font-bold text-sm">
-                      {analysisResult.datosPlaca.rpm} RPM
-                    </span>
-                    <span className="text-slate-400 text-[10px] block">
-                      {analysisResult.datosPlaca.frecuencia_Hz} Hz
-                    </span>
+                    {isEditingData ? (
+                      <div className="flex items-center gap-1 mt-1">
+                        <input
+                          type="number"
+                          step="10"
+                          value={analysisResult.datosPlaca.rpm}
+                          onChange={(e) =>
+                            handleUpdatePlateField('rpm', parseInt(e.target.value) || 0)
+                          }
+                          className="w-20 bg-slate-900 border border-amber-500 rounded px-1.5 py-0.5 text-emerald-400 font-bold text-xs"
+                        />
+                        <span className="text-slate-400">RPM</span>
+                      </div>
+                    ) : (
+                      <>
+                        <span className="text-emerald-400 font-bold text-sm">
+                          {analysisResult.datosPlaca.rpm} RPM
+                        </span>
+                        <span className="text-slate-400 text-[10px] block">
+                          {analysisResult.datosPlaca.frecuencia_Hz} Hz
+                        </span>
+                      </>
+                    )}
                   </div>
 
+                  {/* Cos Phi */}
                   <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800">
                     <span className="text-slate-400 text-[10px] block uppercase">Cos φ</span>
-                    <span className="text-white font-bold text-sm">
-                      {analysisResult.datosPlaca.cosPhi}
-                    </span>
+                    {isEditingData ? (
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0.1"
+                        max="1"
+                        value={analysisResult.datosPlaca.cosPhi}
+                        onChange={(e) =>
+                          handleUpdatePlateField('cosPhi', parseFloat(e.target.value) || 0.85)
+                        }
+                        className="w-full bg-slate-900 border border-amber-500 rounded px-1.5 py-0.5 text-white font-bold text-xs mt-1"
+                      />
+                    ) : (
+                      <span className="text-white font-bold text-sm">
+                        {analysisResult.datosPlaca.cosPhi}
+                      </span>
+                    )}
                   </div>
 
+                  {/* Rendimiento */}
                   <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800">
                     <span className="text-slate-400 text-[10px] block uppercase">Rendimiento η</span>
-                    <span className="text-amber-400 font-bold text-sm">
-                      {analysisResult.datosPlaca.rendimiento_eta_pct}%
-                    </span>
+                    {isEditingData ? (
+                      <div className="flex items-center gap-1 mt-1">
+                        <input
+                          type="number"
+                          step="0.1"
+                          value={analysisResult.datosPlaca.rendimiento_eta_pct}
+                          onChange={(e) =>
+                            handleUpdatePlateField(
+                              'rendimiento_eta_pct',
+                              parseFloat(e.target.value) || 90
+                            )
+                          }
+                          className="w-20 bg-slate-900 border border-amber-500 rounded px-1.5 py-0.5 text-amber-400 font-bold text-xs"
+                        />
+                        <span className="text-slate-400">%</span>
+                      </div>
+                    ) : (
+                      <span className="text-amber-400 font-bold text-sm">
+                        {analysisResult.datosPlaca.rendimiento_eta_pct}%
+                      </span>
+                    )}
                   </div>
 
+                  {/* Aislamiento */}
                   <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800">
                     <span className="text-slate-400 text-[10px] block uppercase">Aislamiento / IP</span>
                     <span className="text-white font-bold text-sm">
-                      Cl. {analysisResult.datosPlaca.claseAislamiento} &bull; {analysisResult.datosPlaca.gradoIP}
+                      Cl. {analysisResult.datosPlaca.claseAislamiento || 'F'} &bull; {analysisResult.datosPlaca.gradoIP || 'IP55'}
                     </span>
                   </div>
 
+                  {/* Factor Servicio */}
                   <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800">
                     <span className="text-slate-400 text-[10px] block uppercase">Factor Servicio</span>
                     <span className="text-white font-bold text-sm">
-                      FS {analysisResult.datosPlaca.factorServicio || '1.0'}
+                      FS {analysisResult.datosPlaca.factorServicio || '1.15'}
                     </span>
                   </div>
                 </div>

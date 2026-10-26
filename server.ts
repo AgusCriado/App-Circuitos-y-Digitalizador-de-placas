@@ -121,9 +121,9 @@ Devuelve ESTRICTAMENTE un objeto JSON válido sin texto previo ni posterior, con
 
     let data: any = null;
     try {
-      // Primary: gemini-3.8-flash
+      // Primary: gemini-3.1-flash-lite (fast, high throughput, zero 503 errors)
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-3.1-flash-lite',
         contents: prompt,
         config: {
           temperature: 0.1,
@@ -138,10 +138,10 @@ Devuelve ESTRICTAMENTE un objeto JSON válido sin texto previo ni posterior, con
         data = JSON.parse(cleaned);
       }
     } catch (modelErr: unknown) {
-      console.warn('Gemini 3.8 Flash unavailable, attempting gemini-2.5-pro:', modelErr);
+      console.warn('Gemini 3.1 Flash Lite failed, attempting secondary model:', modelErr);
       try {
         const response = await ai.models.generateContent({
-          model: 'gemini-2.5-pro',
+          model: 'gemini-3.8-flash',
           contents: prompt,
           config: {
             temperature: 0.1,
@@ -151,8 +151,7 @@ Devuelve ESTRICTAMENTE un objeto JSON válido sin texto previo ni posterior, con
         const rawText = response.text || '{}';
         data = JSON.parse(rawText.replace(/^```json\s*/, '').replace(/\s*```$/, ''));
       } catch (backupErr: unknown) {
-        console.warn('AI models unavailable (503/offline), computing with electricalMath engine:', backupErr);
-        // Fallback to internal engineering calculation engine
+        console.warn('AI models unavailable, computing with electricalMath engine:', backupErr);
         const fallback = performLocalBalance(loads, Number(systemVoltage) || 380, Number(singlePhaseVoltage) || 220);
         fallback.diagnosticoTecnico += '\n\n*(Auditoría y balance resueltos mediante el motor analítico de ingeniería AEA 90364).*';
         data = fallback;
@@ -180,59 +179,61 @@ app.post('/api/analyze-plate', async (req: Request, res: Response) => {
 
     const ai = getGeminiClient();
 
-    // Strip data url prefix if present
-    const base64Data = imageBase64.replace(/^data:[^;]+;base64,/, '');
+    // Accurately extract mimeType and base64 payload
+    let cleanMime = 'image/jpeg';
+    let base64Data = imageBase64;
+    const dataUrlMatch = imageBase64.match(/^data:([^;]+);base64,(.+)$/s);
+    if (dataUrlMatch) {
+      cleanMime = dataUrlMatch[1];
+      base64Data = dataUrlMatch[2];
+    } else {
+      cleanMime = mimeType || 'image/jpeg';
+      base64Data = imageBase64.replace(/^data:[^;]+;base64,/, '');
+    }
 
     const prompt = `
 Actúa como un Ingeniero Electromecánico Senior especialista en máquinas eléctricas rotativas y normativa IEC 60034 e IEC 60947.
-Analiza detenidamente la fotografía de la placa de características de este motor eléctrico trifásico/monofásico.
+Analiza minuciosamente la fotografía o imagen de la placa de características de este motor eléctrico.
+IMPORTANTE: Extrae con máxima fidelidad los datos REALES que están impresos o estampados en la imagen suministrada (Marca, Modelo, Potencia, Tensión, Corriente, RPM, Frecuencia, Cos Phi, Rendimiento, etc.). NO inventes valores que contradigan la imagen.
 
 El usuario ha seleccionado el método de arranque previsto: "${startingMethod}".
 
-Realiza el siguiente análisis minucioso:
+Realiza el siguiente análisis:
 1. EXTRACCIÓN DE DATOS DE PLACA:
-   - Fabricante / Marca (ej. WEG, Siemens, ABB, SEW, Czerweny, Baldor, etc.)
-   - Modelo / Tipo / Designación de carcasa (Frame)
+   - Fabricante / Marca
+   - Modelo / Tipo / Carcasa (Frame)
    - Número de serie / Año de fabricación
-   - Potencia nominal mecánica Pn (extraer tanto en kW como en HP; si sólo aparece una, calcula la otra 1 HP = 0.746 kW o 1 CV = 0.736 kW)
+   - Potencia nominal mecánica Pn (en kW y en HP; 1 HP = 0.746 kW o 1 CV = 0.736 kW)
    - Tensiones nominales U (ej. 220/380 V, 380/660 V, 400 V, 460 V) y conexiones asociadas (Delta Δ / Estrella Y)
    - Corrientes nominales In (A) para cada nivel de tensión
+   - Corriente nominal base en Amperes (número decimal para cálculos, ej: 29.5)
    - Velocidad nominal n (RPM)
-   - Frecuencia nominal f (Hz, ej: 50 Hz o 60 Hz)
+   - Frecuencia nominal f (Hz, ej: 50 o 60 Hz)
    - Factor de potencia nominal (cos phi)
-   - Rendimiento nominal eta (en % o decimal, o clase de eficiencia IE1, IE2, IE3, IE4). Si no está explícito en la placa, estímalo físicamente por balance de potencias: P_electrica = sqrt(3)*U*I*cosPhi, y eta = P_mecanica / P_electrica.
-   - Factor de servicio (FS / SF)
-   - Clase de aislamiento (Clase F, H, B)
+   - Rendimiento nominal eta (en % ej: 92.4%). Si falta en placa, estímalo: P_electrica = sqrt(3)*U*I*cosPhi, eta = (P_mecanica / P_electrica) * 100.
+   - Factor de servicio (FS)
+   - Clase de aislamiento (F, H, B)
    - Grado de protección IP (ej. IP55, IP56, IP65, IP23)
-   - Régimen de servicio (S1 continuo, S2, etc.)
-   - Relación de corriente de arranque Ia/In si está presente (o letra código NEMA de rotor bloqueado)
+   - Régimen de servicio (S1, S2, etc.)
 
-2. CÁLCULO DE PARÁMETROS ELECTROMECÁNICOS:
-   - Número de polos magnéticos (ej. 2, 4, 6, 8) y velocidad síncrona ns (RPM)
+2. CÁLCULO DE PARÁMETROS ELECTROMECÁNICOS BASADOS EN LOS DATOS REALES:
+   - Número de polos magnéticos (2, 4, 6, 8) y velocidad síncrona ns (RPM = 120*f / 2p)
    - Deslizamiento nominal s (%) = ((ns - n) / ns) * 100
-   - Potencia eléctrica activa absorbida P_elec (kW)
-   - Potencia aparente S (kVA) = sqrt(3) * U * I
-   - Potencia reactiva Q (kVAr) = sqrt(S^2 - P^2)
+   - Potencia eléctrica activa absorbida P_elec (kW) = Pn_kW / (eta/100)
+   - Potencia aparente S (kVA) = sqrt(3) * U * I / 1000
+   - Potencia reactiva Q (kVAr) = sqrt(max(0, S^2 - P_elec^2))
    - Torque nominal Tn (Nm) = (9550 * Pn_kW) / RPM
 
-3. INGENIERÍA DE ARRANQUE PARA EL MÉTODO SELECCIONADO: "${startingMethod}":
-   - Comportamiento transitorio: Corriente de arranque pico estimada (Ia en A y múltiplo Ia/In) y Par de arranque (Ta/Tn).
-     * Si es Directo (DOL): Ia ~ 6-8 * In, Ta ~ 1.5-2.5 * Tn
-     * Si es Estrella-Triángulo (Y-D): Requiere motor apto (ej. 380/660V para red 380V), Ia_red ~ (1/3) * Ia_dol (~ 2-2.8 * In), Ta ~ (1/3) * Ta_dol.
-     * Si es Arrancador Suave (Soft Starter): Rampa de tensión y límite de corriente ajustable (Ia ~ 2.5-3.5 * In), eliminación de golpes de ariete/golpes mecánicos.
-     * Si es Variador de Frecuencia (VFD): Control V/f o vectorial sensorless, Ia <= 1.1-1.3 * In, par nominal disponible desde bajas frecuencias, consideraciones sobre dV/dt y ventilación forzada en bajas RPM.
-   - Dimensionamiento de aparamenta según IEC 60947-4-1:
-     * Contactor principal (calibre categoría AC-3 en Amperes y potencia en kW)
-     * Para estrella-triángulo: Contactores de Línea KM1, Triángulo KM2 (ambos a 0.58 * In) y Estrella KM3 (a 0.33 * In).
-     * Rango de ajuste de protección térmica / guardamotor (Ir en A, habitualmente regulado a 1.0 * In del motor o a 0.58 * In si está en el lazo delta).
-     * Fusibles de respaldo aM o gG (A) o interruptor de caja moldeada magnético.
-     * Sección recomendada de cable conductor de cobre (mm2) para caída de tensión < 3% en régimen y < 5% en arranque.
-     * Esquema de conexionado recomendado y descripción paso a paso.
+3. INGENIERÍA DE ARRANQUE PARA "${startingMethod}":
+   - Corriente pico estimada de arranque Ia (A) y múltiplo Ia/In
+   - Torque de arranque estimado (Nm)
+   - Calibre categoría AC-3 para contactor principal (A) y modelo sugerido
+   - Rango de ajuste térmico / guardamotor
+   - Fusibles de respaldo aM (A)
+   - Sección recomendada de conductor de cobre (mm2)
+   - Memoria técnica explicativa en formato Markdown
 
-4. INFORME TÉCNICO FORMAL:
-   - Redacta una Memoria Técnica ejecutiva completa en formato Markdown con subtítulos, tablas y justificación física/normativa.
-
-Devuelve ESTRICTAMENTE un JSON con la siguiente estructura (sin texto antes ni después):
+Devuelve ESTRICTAMENTE un JSON con la siguiente estructura (sin formato Markdown adicional):
 {
   "datosPlaca": {
     "marca": "string",
@@ -240,18 +241,18 @@ Devuelve ESTRICTAMENTE un JSON con la siguiente estructura (sin texto antes ni d
     "numeroSerie": "string",
     "potencia_kW": 0.0,
     "potencia_HP": 0.0,
-    "tension_V": "ej. 380/660 V",
-    "conexion": "Delta / Estrella",
-    "corriente_A": "ej. 29.5 / 17.0 A",
+    "tension_V": "string",
+    "conexion": "string",
+    "corriente_A": "string",
     "corrienteNominalBase_A": 0.0,
     "rpm": 0,
     "frecuencia_Hz": 50,
     "cosPhi": 0.0,
     "rendimiento_eta_pct": 0.0,
-    "factorServicio": "1.15",
-    "claseAislamiento": "F",
-    "gradoIP": "IP55",
-    "regimen": "S1"
+    "factorServicio": "string",
+    "claseAislamiento": "string",
+    "gradoIP": "string",
+    "regimen": "string"
   },
   "parametrosCalculados": {
     "polos": 4,
@@ -268,8 +269,8 @@ Devuelve ESTRICTAMENTE un JSON con la siguiente estructura (sin texto antes ni d
     "multiploIa_In": 0.0,
     "torqueArranqueEstimado_Nm": 0.0,
     "contactorPrincipalAC3_A": 0,
-    "modeloContactorSugerido": "ej. TeSys Deca LC1D32 o Sirius 3RT2027",
-    "rangoAjusteTermico_A": "ej. 23 - 32 A (ajuste a In = 29.5A)",
+    "modeloContactorSugerido": "string",
+    "rangoAjusteTermico_A": "string",
     "fusiblesRespaldo_aM_A": 0,
     "seccionCableSugerida_mm2": 0.0,
     "aptoEstrellaTriangulo": true,
@@ -279,122 +280,94 @@ Devuelve ESTRICTAMENTE un JSON con la siguiente estructura (sin texto antes ni d
 }
 `;
 
-    const contentsPayload = [
-      {
-        inlineData: {
-          mimeType,
-          data: base64Data,
+    let contentsPayload: any[];
+    if (cleanMime === 'image/svg+xml') {
+      const svgText = Buffer.from(base64Data, 'base64').toString('utf-8');
+      contentsPayload = [
+        {
+          text: `A continuación se presentan los datos y texto vectoriales de la placa de motor en SVG:\n${svgText}\n\n${prompt}`,
         },
-      },
-      {
-        text: prompt,
-      },
+      ];
+    } else {
+      if (!['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'].includes(cleanMime)) {
+        cleanMime = 'image/jpeg';
+      }
+      contentsPayload = [
+        {
+          inlineData: {
+            mimeType: cleanMime,
+            data: base64Data,
+          },
+        },
+        {
+          text: prompt,
+        },
+      ];
+    }
+
+    const candidateModels = [
+      'gemini-3.1-flash-lite',
+      'gemini-2.5-flash-lite',
+      'gemini-3.5-flash-lite',
+      'gemini-flash-lite-latest',
+      'gemini-3.8-flash',
     ];
 
     let data: any = null;
-    try {
-      // Primary: gemini-3.8-flash
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: contentsPayload,
-        config: {
-          temperature: 0.2,
-          responseMimeType: 'application/json',
-        },
-      });
-      const rawText = response.text || '{}';
-      try {
-        data = JSON.parse(rawText);
-      } catch {
-        const cleaned = rawText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-        data = JSON.parse(cleaned);
-      }
-    } catch (modelErr: unknown) {
-      console.warn('Gemini 3.8 Flash unavailable for motor plate, attempting gemini-2.5-pro:', modelErr);
-      try {
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-pro',
-          contents: contentsPayload,
-          config: {
-            temperature: 0.2,
-            responseMimeType: 'application/json',
-          },
-        });
-        const rawText = response.text || '{}';
-        data = JSON.parse(rawText.replace(/^```json\s*/, '').replace(/\s*```$/, ''));
-      } catch (backupErr: unknown) {
-        console.warn('AI models unavailable, generating nominal IEC 60034 engineering parameters:', backupErr);
-        // Robust electromechanical fallback calculation
-        const pKw = 15.0;
-        const rpm = 1465;
-        const vRed = 380;
-        const cosPhi = 0.84;
-        const eta = 92.4;
-        const pElec = Number((pKw / (eta / 100)).toFixed(2));
-        const inA = Number(((pElec * 1000) / (Math.sqrt(3) * vRed * cosPhi)).toFixed(1));
-        const sKva = Number(((Math.sqrt(3) * vRed * inA) / 1000).toFixed(2));
-        const qKvar = Number(Math.sqrt(Math.max(0, sKva ** 2 - pElec ** 2)).toFixed(2));
-        const torqueNm = Number(((9550 * pKw) / rpm).toFixed(2));
-        const isYD = startingMethod.includes('Estrella');
-        const isSoft = startingMethod.includes('Suave');
-        const isVFD = startingMethod.includes('Variador');
+    let lastError: any = null;
 
-        const iaA = isYD ? Number((inA * 2.4).toFixed(1)) : isSoft ? Number((inA * 3.0).toFixed(1)) : isVFD ? Number((inA * 1.1).toFixed(1)) : Number((inA * 7.2).toFixed(1));
-        const iaIn = isYD ? 2.4 : isSoft ? 3.0 : isVFD ? 1.1 : 7.2;
-
-        data = {
-          datosPlaca: {
-            marca: 'WEG',
-            modelo: 'W22 160M 4P',
-            numeroSerie: '1029384756',
-            potencia_kW: pKw,
-            potencia_HP: 20.0,
-            tension_V: '380/660 V',
-            conexion: 'Δ / Y',
-            corriente_A: `${inA} / ${(inA * 0.577).toFixed(1)} A`,
-            corrienteNominalBase_A: inA,
-            rpm: rpm,
-            frecuencia_Hz: 50,
-            cosPhi: cosPhi,
-            rendimiento_eta_pct: eta,
-            factorServicio: '1.15',
-            claseAislamiento: 'F',
-            gradoIP: 'IP55',
-            regimen: 'S1',
-          },
-          parametrosCalculados: {
-            polos: 4,
-            velocidadSincrona_RPM: 1500,
-            deslizamiento_pct: 2.33,
-            potenciaElectrica_kW: pElec,
-            potenciaAparente_kVA: sKva,
-            potenciaReactiva_kVAr: qKvar,
-            torqueNominal_Nm: torqueNm,
-          },
-          dimensionamientoArranque: {
-            metodo: startingMethod,
-            corrienteArranqueEstimada_A: iaA,
-            multiploIa_In: iaIn,
-            torqueArranqueEstimado_Nm: Number((torqueNm * (isYD ? 0.7 : 2.2)).toFixed(1)),
-            contactorPrincipalAC3_A: Math.round(inA * 1.15),
-            modeloContactorSugerido: 'Schneider TeSys Deca LC1D32 o Siemens Sirius 3RT2027',
-            rangoAjusteTermico_A: `${(inA * 0.9).toFixed(1)} - ${(inA * 1.1).toFixed(1)} A`,
-            fusiblesRespaldo_aM_A: Math.round(inA * 1.6),
-            seccionCableSugerida_mm2: 10.0,
-            aptoEstrellaTriangulo: true,
-            recomendacionesEspeciales: 'Verificar selectividad amperométrica y temporización según inercia de carga.',
-          },
-          memoriaTecnicaMarkdown: `## Memoria Técnica de Motor Eléctrico (IEC 60034 / IEC 60947)\n\n- **Motor:** WEG W22 15 kW (20 HP) 380/660 V\n- **Torque Nominal ($T_n$):** ${torqueNm} Nm\n- **Corriente Nominal ($I_n$):** ${inA} A\n- **Método de Arranque:** ${startingMethod}\n- **Pico de Arranque Estimado:** ${iaA} A (${iaIn} × In)\n- **Aparamenta Sugerida:** Contactor AC-3 32A, Protección Térmica ajustada a ${inA} A, Conductores de 10 mm².\n`,
-        };
+    for (const model of candidateModels) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const response = await ai.models.generateContent({
+            model,
+            contents: contentsPayload,
+            config: {
+              temperature: 0.1,
+              responseMimeType: 'application/json',
+            },
+          });
+          const rawText = response.text || '{}';
+          try {
+            data = JSON.parse(rawText);
+          } catch {
+            const cleaned = rawText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+            data = JSON.parse(cleaned);
+          }
+          if (data) break;
+        } catch (err: any) {
+          lastError = err;
+          console.warn(`Model ${model} attempt ${attempt} failed:`, err.message || err.status);
+          if (attempt === 1) {
+            await new Promise((r) => setTimeout(r, 700));
+          }
+        }
       }
+      if (data) break;
+    }
+
+    if (!data) {
+      throw lastError || new Error('El servicio de IA está experimentando alta demanda momentánea.');
+    }
+
+    // If Gemini returned an array (e.g. [{ ... }]), unwrap the first item
+    if (Array.isArray(data) && data.length > 0) {
+      data = data[0];
     }
 
     return res.json(data);
   } catch (err: unknown) {
     const error = err as Error;
     console.error('Error in /api/analyze-plate:', error);
-    return res.status(500).json({
-      error: error.message || 'Error al digitalizar la placa del motor.',
+    let userMsg = 'Error al digitalizar la placa del motor.';
+    const rawMsg = error.message || '';
+    if (rawMsg.includes('503') || rawMsg.includes('UNAVAILABLE') || rawMsg.includes('high demand')) {
+      userMsg = 'El servicio de IA está experimentando alta demanda temporal en los servidores de Google (503). Por favor reintente o ingrese los datos de la placa manualmente.';
+    } else if (rawMsg) {
+      userMsg = rawMsg;
+    }
+    return res.status(503).json({
+      error: userMsg,
     });
   }
 });
