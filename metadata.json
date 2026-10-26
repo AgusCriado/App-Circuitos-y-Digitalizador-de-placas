@@ -1,0 +1,6 @@
+{
+  "name": "Suite de Diagnóstico Electromecánico",
+  "description": "Suite profesional para auditoría y balance de tableros eléctricos (AEA 90364) y digitalización de placas de motores con memoria de cálculo y arranque (IEC 60034).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
